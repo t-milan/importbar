@@ -18,9 +18,10 @@ UNKNOWN_TAU = 3.0       # seconds; asymptotic crawl when there's no history yet
 
 class Progress:
     """What a renderer receives on every frame."""
-    __slots__ = ("fraction", "label", "elapsed", "remaining", "done", "desc", "learning")
+    __slots__ = ("fraction", "label", "elapsed", "remaining", "done", "desc", "learning",
+                 "cold")
 
-    def __init__(self, fraction, label, elapsed, remaining, done, desc, learning):
+    def __init__(self, fraction, label, elapsed, remaining, done, desc, learning, cold=None):
         self.fraction = fraction    # smoothed, 0..1, monotonic
         self.label = label          # package currently importing (or None)
         self.elapsed = elapsed
@@ -28,6 +29,7 @@ class Progress:
         self.done = done
         self.desc = desc
         self.learning = learning    # True on a first run with no history
+        self.cold = cold            # probability this is a cold start (None if unknown)
 
     def __repr__(self):
         return "Progress(%.3f, %r, elapsed=%.2f, done=%s)" % (
@@ -89,7 +91,7 @@ class Display(threading.Thread):
             frac = self.smoother.step(now - last_t, est)
             last_t = now
             self.last = Progress(frac, est.label, est.elapsed, est.remaining,
-                                 False, s.desc, est.fraction is None)
+                                 False, s.desc, est.fraction is None, est.cold)
             try:
                 self.renderer(self.last)
                 self.rendered = True
@@ -101,7 +103,8 @@ class Display(threading.Thread):
         self._stop_evt.set()
         self.join()
         if self.rendered:
-            final = Progress(1.0, None, elapsed, 0.0, True, self.session.desc, False)
+            final = Progress(1.0, None, elapsed, 0.0, True, self.session.desc, False,
+                             getattr(self.session, "cold", None))
             try:
                 self.renderer(final)
             except Exception:
@@ -161,6 +164,8 @@ class TerminalRenderer:
             tail = "%.1fs (learning%s)" % (p.elapsed, self.ell)
         else:
             tail = "%.1fs, ~%.1fs left" % (p.elapsed, max(p.remaining or 0.0, 0.0))
+            if p.cold is not None and p.cold >= 0.7:
+                tail += " (cold start)"
         label = p.label or ""
         bar_w = max(10, min(30, cols // 3))
         head = "%s %s |%s| " % (p.desc, pct, self._bar(p.fraction, bar_w))

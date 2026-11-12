@@ -16,8 +16,11 @@
     ...
     bar.stop()
 
-Timings are learned per environment and stored in a small JSON cache, so the
-first run shows an indeterminate "learning" bar and later runs are accurate.
+Timings are learned per environment, separately for warm and cold starts,
+and stored in a small cache file. To give other machines a head start, run
+``python -m importbar measure your_script.py``: it writes
+``importbar-profile.txt`` next to your code, and importbar picks it up
+automatically wherever the code runs.
 Set IMPORTBAR_DISABLE=1 to turn everything into a plain import.
 """
 
@@ -30,20 +33,24 @@ from ._session import Session
 from ._store import Store
 
 __all__ = ["load", "progress", "start", "Progress", "TerminalRenderer", "Session", "Store"]
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 
-def _caller_label(depth=2):
+def _caller(depth=2):
+    """(label, directory) of the code calling into importbar."""
     try:
         f = sys._getframe(depth)
         code = f.f_code
-        return "%s::%s" % (os.path.abspath(code.co_filename), code.co_name)
+        path = os.path.abspath(code.co_filename)
+        # Notebooks and `python -c` have no file: look for a profile in the cwd.
+        d = os.path.dirname(path) if os.path.isfile(path) else os.getcwd()
+        return "%s::%s" % (path, code.co_name), d
     except (AttributeError, ValueError):
-        return "default"
+        return "default", None
 
 
 def progress(desc="Importing", *, label=None, display=None, renderer=None,
-             delay=0.2, fps=20, leave=False):
+             delay=0.2, fps=20, leave=False, profile=None, _depth=2):
     """Context manager showing a bar for whatever is imported inside the block.
 
     The block's imports are learned from previous runs, keyed by ``label``
@@ -53,25 +60,31 @@ def progress(desc="Importing", *, label=None, display=None, renderer=None,
     renderer: callable receiving a :class:`Progress` each frame; may define
               ``close(rendered)``. Use it to drive rich, tqdm, or a GUI splash.
     delay:    seconds before anything is drawn (fast imports show nothing).
+    profile:  shared timings to start from. None = look for importbar-profile.txt
+              next to the calling file (or one directory up); a path = that
+              file or directory; False = don't use one.
     """
-    return Session(label or _caller_label(), display=display, desc=desc,
-                   renderer=renderer, delay=delay, fps=fps, leave=leave)
+    auto_label, origin = _caller(_depth)
+    return Session(label or auto_label, display=display, desc=desc,
+                   renderer=renderer, delay=delay, fps=fps, leave=leave,
+                   profile=profile, origin=origin)
 
 
 def start(desc="Importing", **kwargs):
     """Start a session now; call ``.stop()`` on the result when loading is done."""
-    kwargs.setdefault("label", _caller_label())
-    return progress(desc, **kwargs).start()
+    return progress(desc, _depth=3, **kwargs).start()
 
 
 def load(*names, desc="Importing", label=None, display=None, renderer=None,
-         delay=0.2, fps=20, leave=False):
+         delay=0.2, fps=20, leave=False, profile=None):
     """Import ``names`` with a progress bar; returns the module (or a tuple of them)."""
     if len(names) == 1 and isinstance(names[0], (list, tuple)):
         names = tuple(names[0])
     roots = [n.partition(".")[0] for n in names]
+    _, origin = _caller()
     sess = Session(label or "load:" + ",".join(names), roots=roots, display=display,
-                   desc=desc, renderer=renderer, delay=delay, fps=fps, leave=leave)
+                   desc=desc, renderer=renderer, delay=delay, fps=fps, leave=leave,
+                   profile=profile, origin=origin)
     with sess:
         mods = tuple(importlib.import_module(n) for n in names)
     return mods[0] if len(mods) == 1 else mods

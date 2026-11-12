@@ -10,23 +10,40 @@ imports ``numpy`` while it executes), so the plan for a session is the
 transitive closure of its root imports *minus whatever is already in
 ``sys.modules``*. Import ``numpy`` early and the bar for ``pandas`` knows to
 expect less work.
+
+Every planned package has two expectations, warm and cold (see ``_model.py``).
+The estimate is their mixture, weighted by the current probability that this
+start is cold, and each is rescaled by its own speed factor fitted to the
+packages that have finished. So even when the cold/warm call is wrong, the
+estimate still tracks reality.
 """
 
+import math
 import os
 import sys
 import threading
+import time
 from time import perf_counter
 
 from . import _hook
-from ._store import Store, stat_mean, stat_update, MAX_MISSES
+from ._model import Model, cold_logit
+from ._store import MODES, Store, boot_time, ratio_update, stat_update, MAX_MISSES
 
 SPEED_PRIOR = 0.05         # seconds of pseudo-evidence pulling the speed factor to 1
 SPEED_MIN, SPEED_MAX = 0.2, 5.0
 DEFAULT_ROOT = 0.25        # guess for an explicitly requested, never-seen package
+CPU_SAMPLE = 0.01          # seconds between samples of the importing thread's CPU time
+
+_thread_time = getattr(time, "thread_time", time.process_time)
 
 
 def disabled():
     return os.environ.get("IMPORTBAR_DISABLE", "").strip().lower() in ("1", "true", "yes")
+
+
+def assumed_mode():
+    m = os.environ.get("IMPORTBAR_ASSUME", "").strip().lower()
+    return m if m in MODES else None
 
 
 def _left(expected, spent, running):
@@ -40,29 +57,35 @@ def _left(expected, spent, running):
 
 
 class Estimate:
-    __slots__ = ("fraction", "remaining", "elapsed", "label")
+    __slots__ = ("fraction", "remaining", "elapsed", "label", "cold")
 
-    def __init__(self, fraction, remaining, elapsed, label):
+    def __init__(self, fraction, remaining, elapsed, label, cold=None):
         self.fraction = fraction    # None = no basis for an estimate yet
         self.remaining = remaining
         self.elapsed = elapsed
         self.label = label
+        self.cold = cold            # probability this is a cold start (None if unknown)
 
 
 class Session:
     def __init__(self, label, roots=None, display=None, desc="Importing",
-                 renderer=None, store=None, delay=0.2, fps=20, leave=False):
+                 renderer=None, store=None, delay=0.2, fps=20, leave=False,
+                 profile=None, origin=None):
         self.label = label
         self.explicit_roots = list(roots) if roots else None
         self._display_opt = display
         self._renderer_opt = renderer
         self._store_opt = store
+        self._profile_opt = profile
+        self.origin = origin      # directory of the calling code: where to look for a profile
         self.desc = desc
         self.delay = delay
         self.fps = fps
         self.leave = leave
         self.active = False
         self.display = None
+        self.profile = None
+        self.mode = None          # "warm" / "cold" once the session has ended
 
     # ---------------------------------------------------------------- lifecycle
 
@@ -71,6 +94,8 @@ class Session:
             return self   # nested or disabled: behave as a plain no-op
         store = self._store_opt or Store.load()
         self.store = store
+        self.profile = self._load_profile()
+        self.model = model = Model(store, self.profile)
         self._lock = threading.Lock()
         self._tls = threading.local()
         self._stacks = []
@@ -83,17 +108,29 @@ class Session:
         self.run_children = {}    # pkg -> pkgs first imported while it executed
         self.roots = []           # pkgs first imported with nothing else executing
         self.current = None
-        self.plan = {}            # pkg -> (expected total, expected eager, from history?)
+        self.plan = {}            # pkg -> ((warm total, eager), (cold total, eager), known?)
+        self._local = {m: set() for m in MODES}   # planned pkgs with this machine's own data
+        self._tau = {}            # pkg -> (tau warm, tau cold)
 
-        hist = store.sessions.get(self.label)
-        roots = self.explicit_roots if self.explicit_roots is not None else (
-            hist["roots"] if hist else [])
+        portable = None
+        if self.profile is not None:
+            from ._profile import portable_label
+            portable = portable_label(self.label, os.path.dirname(self.profile.path))
+        hist_roots, self.exp_other, hist_known = model.session(self.label, portable)
+        roots = self.explicit_roots if self.explicit_roots is not None else (hist_roots or [])
         for r in roots:
             self._extend_plan(r, root=self.explicit_roots is not None)
-        self.known = hist is not None or any(k for _, _, k in self.plan.values())
-        self.exp_other = stat_mean(hist["other"]) if hist and hist.get("other") else 0.0
+        self.known = hist_known or any(k for _, _, k in self.plan.values())
 
+        # Cold or warm? Start from how often starts like this one were cold.
+        self.forced = assumed_mode()
+        self.boot = boot_time()
+        self.prior_cold, self.prior_ctx = model.prior_cold(self.boot, time.time())
+
+        self._main_stack = self._stack()
         self.t0 = perf_counter()
+        self._cpu0 = _thread_time()
+        self._cpu_sample = (self.t0, self._cpu0)
         self.active = True
         _hook.install(self)
         self._start_display()
@@ -104,12 +141,16 @@ class Session:
             return
         _hook.uninstall()
         t_end = perf_counter()
+        self._cpu_sample = (t_end, _thread_time())
         self.active = False
         try:
             if self.display is not None:
                 self.display.finish(t_end - self.t0)
         finally:
             self._learn(t_end - self.t0, ok)
+        if os.environ.get("IMPORTBAR_MEASURE"):
+            from ._measure import child_report
+            child_report(self, t_end - self.t0)   # used by `python -m importbar measure`
 
     def __enter__(self):
         return self.start()
@@ -120,21 +161,37 @@ class Session:
 
     # ---------------------------------------------------------------- planning
 
+    def _load_profile(self):
+        if self._profile_opt is False:
+            return None
+        from ._profile import Profile, find   # only costs anything when used
+        if hasattr(self._profile_opt, "times"):
+            return self._profile_opt          # a Profile object
+        path = find(self.origin, self._profile_opt)
+        return Profile.load(path) if path else None
+
     def _extend_plan(self, pkg, root=False):
         stack = [pkg]
-        store = self.store
+        model = self.model
         while stack:
             p = stack.pop()
             if p in self.plan or p in self.preloaded:
                 continue
-            exp = store.expected(p)
+            exp = model.expect(p)
             if exp is None:
                 if not (root and p == pkg):
                     continue   # unknown non-root: nothing to go on, don't guess
-                self.plan[p] = (DEFAULT_ROOT, DEFAULT_ROOT, False)
+                self.plan[p] = ((DEFAULT_ROOT, DEFAULT_ROOT),
+                                (DEFAULT_ROOT * model.cold_ratio,) * 2, False)
+                self._tau[p] = (1.0, 1.0)
             else:
-                self.plan[p] = (exp[0], exp[1], True)
-            stack.extend(store.edges.get(p, ()))
+                w, c = exp["warm"], exp["cold"]
+                self.plan[p] = ((w[0], w[1]), (c[0], c[1]), True)
+                self._tau[p] = (w[2], c[2])
+                for m in MODES:
+                    if exp[m][3]:
+                        self._local[m].add(p)
+            stack.extend(model.deps(p))
 
     # ---------------------------------------------------------------- hook callbacks
 
@@ -174,6 +231,8 @@ class Session:
         st = self._stack()
         if not st:
             return
+        if st is self._main_stack and now - self._cpu_sample[0] > CPU_SAMPLE:
+            self._cpu_sample = (now, _thread_time())   # one tuple: atomic for readers
         pkg, t_start, child = st.pop()
         incl = now - t_start
         if st:
@@ -186,13 +245,42 @@ class Session:
                 # If this package does (almost) all its work in __init__, planned
                 # children that never started under it aren't coming from it.
                 e = self.plan.get(pkg)
-                if e and e[2] and e[1] >= 0.9 * e[0]:
-                    for c in self.store.edges.get(pkg, ()):
+                if e and e[2] and e[0][1] >= 0.9 * e[0][0]:
+                    for c in self.model.deps(pkg):
                         if c in self.plan and c not in self.started:
                             self.skipped.add(c)
             self.current = st[-1][0] if st else None
 
     # ---------------------------------------------------------------- estimation
+
+    def _fit(self):
+        """Eager time of finished packages: observed, and expected per mode."""
+        num = dw = dc = tw = tc = 0.0
+        plan, tau, at_done = self.plan, self._tau, self.spent_at_done
+        for p in self.done:
+            e = plan.get(p)
+            if e and e[2]:
+                num += at_done[p]
+                w, c = e[0][1], e[1][1]
+                dw += w
+                dc += c
+                t = tau[p]
+                tw += w * t[0]
+                tc += c * t[1]
+        return (num, dw, dc, tw / dw if dw > 0 else 1.0, tc / dc if dc > 0 else 1.0)
+
+    def cold_probability(self, fit=None):
+        """Probability that this is a cold start, given everything seen so far."""
+        if self.forced:
+            return 1.0 if self.forced == "cold" else 0.0
+        if fit is None:
+            with self._lock:
+                fit = self._fit()
+        t, c = self._cpu_sample
+        el = t - self.t0
+        ratio = (c - self._cpu0) / el if el > 0 else None
+        z = cold_logit(self.prior_cold, fit, ratio, el, self.model)
+        return 1.0 / (1.0 + math.exp(-z))
 
     def estimate(self, now=None):
         """Cheap: O(planned packages), called a few times a second by the display."""
@@ -210,57 +298,69 @@ class Session:
             if not self.known:
                 return Estimate(None, None, elapsed, label)
 
-            # Global speed factor: is this run slower than usual across the board?
-            # Compared on the eager phase, which is complete once __init__ returns.
-            num = den = SPEED_PRIOR
-            for p in self.done:
-                e = self.plan.get(p)
-                if e and e[2]:
-                    num += self.spent_at_done[p]
-                    den += e[1]
-            s = min(max(num / den, SPEED_MIN), SPEED_MAX)
+            fit = self._fit()
+            pc = self.cold_probability(fit)
 
-            remaining = 0.0
+            # Speed factor per mode: is this run slower than that mode's history?
+            # Compared on the eager phase, which is complete once __init__ returns.
+            num, dw, dc = fit[0] + SPEED_PRIOR, fit[1] + SPEED_PRIOR, fit[2] + SPEED_PRIOR
+            sw = min(max(num / dw, SPEED_MIN), SPEED_MAX)
+            sc = min(max(num / dc, SPEED_MIN), SPEED_MAX)
+
+            rw = rc = 0.0
             done, started, at_done = self.done, self.started, self.spent_at_done
-            for p, (total, eager, _) in self.plan.items():
+            for p, (w, c, _) in self.plan.items():
                 if p in self.skipped:
                     continue
                 sp = spent.get(p, 0.0)
-                lazy = s * (total - eager)   # work done later by lazily imported submodules
-                if p in done:
-                    r = _left(lazy, sp - at_done[p], p in on_stack)
+                if p in done:   # what's left is work done later by lazily imported submodules
+                    a, running = sp - at_done[p], p in on_stack
+                    rw += _left(sw * (w[0] - w[1]), a, running)
+                    rc += _left(sc * (c[0] - c[1]), a, running)
                 elif p in started:
-                    r = _left(s * eager, sp, True) + lazy
+                    rw += _left(sw * w[1], sp, True) + sw * (w[0] - w[1])
+                    rc += _left(sc * c[1], sp, True) + sc * (c[0] - c[1])
                 else:
-                    r = s * total
-                remaining += r
+                    rw += sw * w[0]
+                    rc += sc * c[0]
             other_so_far = max(elapsed - sum(spent.values()), 0.0)
-            remaining += max(s * self.exp_other - other_so_far, 0.0)
+            rw += max(sw * self.exp_other["warm"] - other_so_far, 0.0)
+            rc += max(sc * self.exp_other["cold"] - other_so_far, 0.0)
 
+        remaining = pc * rc + (1.0 - pc) * rw
         total = elapsed + remaining
         frac = elapsed / total if total > 0 else 1.0
-        return Estimate(frac, remaining, elapsed, label)
+        return Estimate(frac, remaining, elapsed, label, pc)
 
     # ---------------------------------------------------------------- learning
 
     def _learn(self, elapsed, ok):
         store = self.store
+        with self._lock:
+            fit = self._fit()
+        self.cold = pc = self.cold_probability(fit)
+        mode = self.mode = "cold" if pc >= 0.5 else "warm"
+
         # Model: duration = run speed × package base time. Learn the base time by
-        # dividing out this run's overall speed, so one slow run (busy machine,
-        # cold disk) is recorded as "slow run", not "every package got slower".
+        # dividing out this run's overall speed, so one slow run (busy machine)
+        # is recorded as "slow run", not "every package got slower". Only this
+        # machine's own history counts here: dividing by a profile's numbers
+        # would just copy the author's machine.
         num = den = 0.0
+        local = self._local[mode]
+        idx = 0 if mode == "warm" else 1
         for p in self.done:
-            e = self.plan.get(p)
-            if e and e[2]:
+            if p in local:
                 num += self.spent_at_done[p]
-                den += e[1]
+                den += self.plan[p][idx][1]
         speed = min(max(num / den, SPEED_MIN), SPEED_MAX) if den > 0.02 else 1.0
         self.run_speed = speed
+        times = store.times[mode]
         for p in self.done:
             if p not in self.preloaded:
-                store.packages[p] = stat_update(store.packages.get(p),
-                                                self.spent.get(p, 0.0) / speed)
-                store.eager[p] = stat_update(store.eager.get(p), self.spent_at_done[p] / speed)
+                old = times.get(p) or (None, None)
+                times[p] = [stat_update(old[0], self.spent.get(p, 0.0) / speed),
+                            stat_update(old[1], self.spent_at_done[p] / speed)]
 
         for parent, kids in self.run_children.items():
             d = store.edges.setdefault(parent, {})
@@ -282,6 +382,14 @@ class Session:
                 if d[c] >= MAX_MISSES:
                     del d[c]
 
+        t, c = self._cpu_sample
+        if t - self.t0 >= 0.3 and self.done:
+            store.cpu[mode] = ratio_update(store.cpu.get(mode), (c - self._cpu0) / (t - self.t0))
+        if ok and not self.forced and self.done:
+            cold, n = store.priors.get(self.prior_ctx, (0, 0))
+            store.priors[self.prior_ctx] = [cold + (mode == "cold"), n + 1]
+        store.last = {"boot": self.boot, "end": time.time()}
+
         if ok:
             prev = store.sessions.get(self.label, {})
             if self.explicit_roots is not None:
@@ -292,11 +400,10 @@ class Session:
                     if r not in roots and (r in self.preloaded or r in self.started):
                         roots.append(r)
             other = max(elapsed - sum(self.spent.values()), 0.0)
-            store.sessions[self.label] = {
-                "roots": roots,
-                "other": stat_update(prev.get("other"), other / speed),
-                "total": stat_update(prev.get("total"), elapsed),
-            }
+            o, tot = dict(prev.get("other", {})), dict(prev.get("total", {}))
+            o[mode] = stat_update(o.get(mode), other / speed)
+            tot[mode] = stat_update(tot.get(mode), elapsed)
+            store.sessions[self.label] = {"roots": roots, "other": o, "total": tot}
         store.save()
 
     # ---------------------------------------------------------------- display
