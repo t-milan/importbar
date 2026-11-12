@@ -32,7 +32,7 @@ committing, and it parses in well under a millisecond without ``import json``
 import os
 import sys
 
-from ._store import MODES, stat_mean
+from ._store import MODES, bundle_dir, stat_mean
 
 FILENAME = "importbar-profile.txt"
 HEADER = "importbar-profile 1"
@@ -171,7 +171,8 @@ def find(origin_dir, explicit=None):
     ``explicit`` is the ``profile=`` argument: False disables profiles, a path
     names a file or the directory holding one. Otherwise ``IMPORTBAR_PROFILE``,
     then ``origin_dir`` and its parent are searched (so a profile at the root
-    of a ``src/`` layout is found too).
+    of a ``src/`` layout is found too). In a frozen app the search stays inside
+    the bundle.
     """
     if explicit is False:
         return None
@@ -184,10 +185,13 @@ def find(origin_dir, explicit=None):
     if not origin_dir:
         return None
     d = origin_dir
+    bundle = bundle_dir()
     for _ in range(2):
         p = os.path.join(d, FILENAME)
         if os.path.isfile(p):
             return p
+        if bundle and os.path.normcase(d) == os.path.normcase(bundle):
+            break   # a one-file build's parent is the system temp folder
         parent = os.path.dirname(d)
         if parent == d:
             break
@@ -198,8 +202,13 @@ def find(origin_dir, explicit=None):
 def portable_label(label, base_dir):
     """Session label as stored in a profile: file paths relative to the profile."""
     path, sep, func = label.rpartition("::")
-    if not sep or not os.path.isabs(path) or not base_dir:
+    if not sep or not base_dir:
         return label
+    if not os.path.isabs(path):
+        bundle = bundle_dir()   # frozen app: labels are relative to the bundle
+        if not bundle:
+            return label
+        path = os.path.join(bundle, path)
     try:
         rel = os.path.relpath(path, base_dir)
     except ValueError:   # different drive on Windows
@@ -209,8 +218,12 @@ def portable_label(label, base_dir):
 
 # ---------------------------------------------------------------------- building
 
-def build(store, labels, base_dir):
-    """A profile with the given sessions from a local store, and everything they import."""
+def build(store, labels, base_dir, names=None):
+    """A profile with the given sessions from a local store, and everything they import.
+
+    ``names`` optionally maps a label to the name it gets in the profile;
+    otherwise the name is the label made relative to ``base_dir``.
+    """
     prof = Profile()
     prof.info = "python=%s platform=%s" % (sys.version.split()[0], sys.platform)
     for m in MODES:
@@ -221,7 +234,8 @@ def build(store, labels, base_dir):
         s = store.sessions.get(label)
         if not s:
             continue
-        prof.sessions[portable_label(label, base_dir)] = {
+        name = (names or {}).get(label) or portable_label(label, base_dir)
+        prof.sessions[name] = {
             "roots": list(s.get("roots", [])),
             "other": {m: stat_mean(st) for m, st in s.get("other", {}).items()},
             "total": {m: stat_mean(st) for m, st in s.get("total", {}).items()},

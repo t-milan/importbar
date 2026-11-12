@@ -3,7 +3,8 @@
     python -m importbar measure app.py [args]   # time warm + cold starts, write importbar-profile.txt
     python -m importbar measure -m mypkg        # same, for python -m mypkg
     python -m importbar export [DIR]            # refresh DIR's profile from what this machine learned
-    python -m importbar report                  # slowest packages in this environment
+    python -m importbar export DIR --from dist/app.exe   # ... from what a PyInstaller build learned
+    python -m importbar report [--from APP]     # slowest packages in this environment (or app)
     python -m importbar try numpy pandas
     python -m importbar clear
     python -m importbar path
@@ -12,7 +13,7 @@
 import os
 import sys
 
-from ._store import MODES, Store, stat_mean
+from ._store import MODES, Store, cache_dir, frozen_history, stat_mean
 
 
 def _report(store, top):
@@ -50,8 +51,20 @@ def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     cmd = argv.pop(0) if argv else "report"
     if cmd == "report":
+        path = None
+        if "--from" in argv:
+            i = argv.index("--from")
+            if i + 1 >= len(argv):
+                print("usage: python -m importbar report [N] [--from APP]")
+                return 2
+            app = argv[i + 1]
+            del argv[i:i + 2]
+            path = frozen_history(app)
+            if path is None:
+                print("No history found for %s in %s." % (app, cache_dir()))
+                return 1
         top = int(argv[0]) if argv else 25
-        _report(Store.load(), top)
+        _report(Store.load(path), top)
     elif cmd == "measure":
         from ._measure import measure
         return measure(argv)

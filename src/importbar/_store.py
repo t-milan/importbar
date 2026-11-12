@@ -80,12 +80,60 @@ def cache_dir():
     return os.path.join(base, "importbar")
 
 
-def env_key():
-    s = "%s|%s|%d.%d" % (sys.prefix, sys.implementation.name, *sys.version_info[:2])
+def bundle_dir():
+    """Folder holding a frozen app's bundled code (PyInstaller & co.), else None."""
+    if not getattr(sys, "frozen", False):
+        return None
+    return getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(sys.executable))
+
+
+def env_key(frozen_exe=None, version=None):
+    """Name of this environment's history file (or of the frozen app ``frozen_exe``'s)."""
+    if frozen_exe is None and getattr(sys, "frozen", False):
+        frozen_exe = sys.executable
+    if frozen_exe is not None:
+        # A frozen app's sys.prefix is where its files were unpacked: for a
+        # PyInstaller one-file build, a new temp folder on every launch. The
+        # executable's own path is what stays the same from run to run.
+        where = "frozen:" + os.path.normcase(os.path.abspath(frozen_exe))
+    else:
+        where = sys.prefix
+    major, minor = version or sys.version_info[:2]
+    s = "%s|%s|%d.%d" % (where, sys.implementation.name, major, minor)
     h = 0xCBF29CE484222325  # FNV-1a: stable across runs, no hashlib import
     for b in s.encode("utf-8", "surrogateescape"):
         h = ((h ^ b) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
     return "%016x" % h
+
+
+def frozen_history(app):
+    """Path of the history a frozen app keeps on this machine, or None.
+
+    ``app`` is the executable, a one-folder build's folder, a macOS ``.app``,
+    or a history file itself. The app may bundle any Python version, so every
+    plausible one is tried and the most recently written file wins.
+    """
+    app = os.path.abspath(app)
+    if os.path.isfile(app) and app.endswith(".bin"):
+        return app
+    if os.path.isdir(app):
+        name = os.path.basename(app.rstrip(os.sep))
+        if name.endswith(".app"):
+            app = os.path.join(app, "Contents", "MacOS", name[:-4])
+        else:
+            app = os.path.join(app, name)
+    exes = [app]
+    if sys.platform == "win32" and not app.lower().endswith(".exe"):
+        exes.insert(0, app + ".exe")
+    found = []
+    for exe in exes:
+        for minor in range(6, 40):
+            p = os.path.join(cache_dir(), "timings-%s.bin" % env_key(exe, (3, minor)))
+            try:
+                found.append((os.path.getmtime(p), p))
+            except OSError:
+                pass
+    return max(found)[1] if found else None
 
 
 def default_path():
