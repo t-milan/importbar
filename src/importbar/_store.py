@@ -80,8 +80,22 @@ def cache_dir():
     return os.path.join(base, "importbar")
 
 
+def bundle_dir():
+    """Folder holding a frozen app's bundled code (PyInstaller & co.), else None."""
+    if not getattr(sys, "frozen", False):
+        return None
+    return getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(sys.executable))
+
+
 def env_key():
-    s = "%s|%s|%d.%d" % (sys.prefix, sys.implementation.name, *sys.version_info[:2])
+    if getattr(sys, "frozen", False):
+        # A frozen app's sys.prefix is where its files were unpacked: for a
+        # PyInstaller one-file build, a new temp folder on every launch. The
+        # executable's own path is what stays the same from run to run.
+        where = "frozen:" + os.path.abspath(sys.executable)
+    else:
+        where = sys.prefix
+    s = "%s|%s|%d.%d" % (where, sys.implementation.name, *sys.version_info[:2])
     h = 0xCBF29CE484222325  # FNV-1a: stable across runs, no hashlib import
     for b in s.encode("utf-8", "surrogateescape"):
         h = ((h ^ b) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF

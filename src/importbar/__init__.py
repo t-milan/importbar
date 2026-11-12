@@ -30,7 +30,7 @@ import sys
 
 from ._display import Progress, TerminalRenderer
 from ._session import Session
-from ._store import Store
+from ._store import Store, bundle_dir
 
 __all__ = ["load", "progress", "start", "Progress", "TerminalRenderer", "Session", "Store"]
 __version__ = "0.2.0"
@@ -41,6 +41,14 @@ def _caller(depth=2):
     try:
         f = sys._getframe(depth)
         code = f.f_code
+        bundle = bundle_dir()
+        if bundle and not os.path.isabs(code.co_filename):
+            # Frozen apps (PyInstaller) name bundled code relative to the bundle,
+            # which for a one-file build is a new temp folder on every launch.
+            # Label by that relative path, so the history and a shipped profile
+            # keep matching, and look for the profile inside the bundle.
+            rel = code.co_filename.replace("\\", "/")
+            return "%s::%s" % (rel, code.co_name), os.path.join(bundle, os.path.dirname(rel))
         path = os.path.abspath(code.co_filename)
         # Notebooks and `python -c` have no file: look for a profile in the cwd.
         d = os.path.dirname(path) if os.path.isfile(path) else os.getcwd()

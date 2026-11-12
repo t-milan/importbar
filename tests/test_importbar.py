@@ -436,3 +436,71 @@ def test_profile_text_roundtrip_and_damage(tmp_path):
     assert Profile.load(str(path)) is None
     path.write_text("something else\n")
     assert Profile.load(str(path)) is None
+
+
+# ------------------------------------------------------------------ frozen apps
+
+def test_frozen_app_labels_cache_key_and_profile_lookup(tmp_path, monkeypatch):
+    import importbar
+    from importbar import _profile, _store
+    normal = _store.env_key()
+    bundle = tmp_path / "_MEI123"
+    (bundle / "myapp").mkdir(parents=True)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(bundle), raising=False)
+    monkeypatch.setattr(sys, "executable", str(tmp_path / "app.exe"))
+
+    # One-file builds unpack to a new folder per launch: the key must not follow it.
+    key = _store.env_key()
+    monkeypatch.setattr(sys, "prefix", str(tmp_path / "_MEI456"))
+    assert _store.env_key() == key != normal
+
+    # PyInstaller names bundled code relative to the bundle; the label must not
+    # depend on the working directory, and the profile is looked for inside.
+    ns = {}
+    exec(compile("import importbar\nres = importbar._caller(1)\n", "myapp/cli.py", "exec"), ns)
+    assert ns["res"] == ("myapp/cli.py::<module>", str(bundle / "myapp"))
+    assert _profile.portable_label("myapp/cli.py::main", str(bundle / "myapp")) == "cli.py::main"
+    assert _profile.portable_label("myapp/cli.py::main", str(bundle)) == "myapp/cli.py::main"
+
+    # The search goes from the code's folder up to the bundle root, never above it.
+    (tmp_path / _profile.FILENAME).write_text(_profile.HEADER + "\n")
+    assert _profile.find(str(bundle)) is None
+    (bundle / _profile.FILENAME).write_text(_profile.HEADER + "\n")
+    assert _profile.find(str(bundle / "myapp")) == str(bundle / _profile.FILENAME)
+
+
+def test_pyinstaller_onefile_build_uses_profile_and_learns(env):
+    pytest.importorskip("PyInstaller")
+    d = _app(env)
+    env(None, args=["-m", "importbar", "measure", "--runs", "2", "--cold", "0", "app.py"], cwd=d)
+    build = env.tmp / "build"
+    out = subprocess.run(
+        [sys.executable, "-m", "PyInstaller", "--onefile", "--noconfirm", "--log-level", "WARN",
+         "--name", "app", "--distpath", str(build / "dist"), "--workpath", str(build / "work"),
+         "--specpath", str(build), "--paths", os.path.abspath(SRC), "--paths", str(env.tmp / "pkgs"),
+         "--add-data", "%s%s." % (d / "importbar-profile.txt", os.pathsep), str(d / "app.py")],
+        capture_output=True, text=True, timeout=600)
+    assert out.returncode == 0, out.stdout + out.stderr
+    exe = build / "dist" / ("app.exe" if sys.platform == "win32" else "app")
+    cache = env.tmp / "cache-frozen"
+    e = dict(os.environ, IMPORTBAR_CACHE_DIR=str(cache))
+    e.pop("IMPORTBAR_DISABLE", None)
+    e.pop("IMPORTBAR_PROFILE", None)
+
+    def run():
+        # Launched from an unrelated folder, as users do.
+        p = subprocess.run([str(exe)], env=e, cwd=str(env.tmp), capture_output=True,
+                           text=True, timeout=120)
+        assert p.returncode == 0, p.stdout + p.stderr
+        return json.loads([l for l in p.stdout.splitlines() if l.startswith("{")][-1])
+
+    first = run()
+    assert first["profile"] and first["known"]     # the bundled profile was found
+    second = run()
+    assert second["known"]
+    files = list(cache.glob("timings-*.bin"))
+    assert len(files) == 1                          # same history on every launch
+    st = marshal.loads(files[0].read_bytes())
+    assert st["sessions"]["app.py::<module>"]["total"]["warm"][2] == 2
+    assert {"fa", "fb", "fc"} <= set(st["times"]["warm"])

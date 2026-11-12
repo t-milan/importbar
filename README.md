@@ -135,6 +135,36 @@ first run after each reboot is detected as cold. Once you've rebooted and run
 your program a couple of times, `python -m importbar export .` refreshes the
 profile with everything this machine has learned, cold starts included.
 
+## Frozen apps (PyInstaller)
+
+Apps built with PyInstaller (one-file or one-folder) work without extra
+code. Measure the source as usual, then bundle the profile next to the
+bundled copy of the file that calls importbar:
+
+```
+python -m importbar measure app.py
+pyinstaller --onefile --add-data "importbar-profile.txt:." app.py
+```
+
+For code inside a package (say `myapp/cli.py`), measure it the same way and
+add the profile as `myapp/importbar-profile.txt:myapp` (or at the bundle
+root, `:.`). In a frozen app importbar:
+
+- **keys its history by the executable's path**, not `sys.prefix`. A
+  one-file build unpacks itself to a new temp folder on every launch, so the
+  prefix changes each time.
+- **labels sessions by their path inside the bundle** (`app.py::<module>`),
+  the same label `measure` writes into the profile. So the label doesn't
+  depend on where the user launched the app from.
+- **looks for the profile inside the bundle** (`sys._MEIPASS`), in the
+  calling file's folder and then upwards, but never above the bundle root.
+
+Use `with importbar.progress():` around real `import` statements rather than
+`importbar.load("pandas")`. PyInstaller only collects imports it can see in
+the code; names passed as strings need `--hidden-import`. A `--noconsole`
+build has no `sys.stderr`, so pass a `renderer=` (for example one that calls
+`pyi_splash.update_text`) to show the progress.
+
 ## How it works
 
 The package has three layers, each in its own module:
