@@ -133,22 +133,46 @@ Windows and macOS have no unprivileged way to empty the file cache, so
 `measure` can't simulate cold starts there. importbar learns them anyway: the
 first run after each reboot is detected as cold. Once you've rebooted and run
 your program a couple of times, `python -m importbar export .` refreshes the
-profile with everything this machine has learned, cold starts included.
+profile with everything this machine has learned, cold starts included. (For
+a PyInstaller build, see `--from` below.)
 
 ## Frozen apps (PyInstaller)
 
 Apps built with PyInstaller (one-file or one-folder) work without extra
-code. Measure the source as usual, then bundle the profile next to the
-bundled copy of the file that calls importbar:
+code. Measure the source as usual. `measure` then prints the `--add-data`
+argument that puts the profile in the right place inside the bundle:
 
 ```
 python -m importbar measure app.py
+...
+To bundle it with PyInstaller, add:  --add-data "importbar-profile.txt:."
+(in a .spec file:  datas=[('importbar-profile.txt', '.')])
+
 pyinstaller --onefile --add-data "importbar-profile.txt:." app.py
 ```
 
-For code inside a package (say `myapp/cli.py`), measure it the same way and
-add the profile as `myapp/importbar-profile.txt:myapp` (or at the bundle
-root, `:.`). In a frozen app importbar:
+For code inside a package, say `myapp/cli.py`, it prints
+`--add-data "myapp/importbar-profile.txt:myapp"`. The profile has to sit in
+the same place relative to the code inside the bundle as in the source tree,
+because session names in it are paths relative to the profile.
+
+**Cold starts of the built app.** The built app keeps its own history, apart
+from your development environment's, and its cold starts can differ from the
+source's (a one-file build unpacks itself first, and antivirus scans the
+freshly unpacked DLLs). To put them in the profile, reboot, run the built app
+a couple of times, then:
+
+```
+python -m importbar export . --from dist/app.exe
+```
+
+`--from` takes the executable, a one-folder build's folder or a macOS `.app`,
+and works whichever Python version the app bundles. Give the folder holding
+the source file that calls importbar. Session names are matched to the source
+files there. `python -m importbar report --from dist/app.exe` shows what the
+built app has learned.
+
+In a frozen app importbar:
 
 - **keys its history by the executable's path**, not `sys.prefix`. A
   one-file build unpacks itself to a new temp folder on every launch, so the

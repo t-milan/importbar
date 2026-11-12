@@ -15,7 +15,7 @@ import os
 import sys
 
 from . import _profile
-from ._store import MODES, Store
+from ._store import MODES, Store, cache_dir, frozen_history
 
 
 # --------------------------------------------------------------------- child side
@@ -37,6 +37,7 @@ def child_report(session, elapsed):
     except OSError:
         pass
     data = {"label": session.label, "origin": session.origin, "elapsed": elapsed,
+            "bundle_dir": _bundle_rel(session.origin),
             "mode": session.mode, "cold": getattr(session, "cold", None),
             "files": sorted(files)}
     try:
@@ -49,6 +50,28 @@ def child_report(session, elapsed):
             except Exception:
                 pass
         os._exit(0)
+
+
+def _bundle_rel(origin):
+    """Where a freezer (PyInstaller) puts the folder ``origin``: its path inside
+    the bundle, "" for the bundle root, None if unknown. Bundles are laid out
+    by module name, so this comes from the modules loaded from that folder."""
+    if not origin:
+        return None
+    origin = os.path.normcase(origin)
+    for name, m in list(sys.modules.items()):
+        f = getattr(m, "__file__", None)
+        if not isinstance(f, str) or os.path.normcase(os.path.dirname(os.path.abspath(f))) != origin:
+            continue
+        if name == "__main__":
+            spec = getattr(m, "__spec__", None)
+            if spec is None:
+                return ""          # a script: the bundle's entry point, at its root
+            name = spec.name       # python -m pkg: pkg.__main__
+        if os.path.basename(f).startswith("__init__."):
+            return name.replace(".", "/")
+        return name.rpartition(".")[0].replace(".", "/")
+    return None
 
 
 # --------------------------------------------------------------------- parent side
@@ -182,7 +205,33 @@ def measure(argv):
         print("profile later.")
     print("\nwrote %s" % _rel(path))
     print("Ship it next to your code; importbar finds it there automatically.")
+    dest = _bundle_dest(first.get("bundle_dir"), origin, os.path.dirname(path))
+    if dest is not None:
+        src = _rel(path)
+        print("\nTo bundle it with PyInstaller, add:  --add-data \"%s:%s\"" % (src, dest))
+        print("(in a .spec file:  datas=[(%r, %r)])" % (src, dest))
     return 0
+
+
+def _bundle_dest(code_dir, origin, profile_dir):
+    """Folder inside a PyInstaller bundle where the profile must go, or None.
+
+    At run time the profile is looked for in the calling file's folder and the
+    one above, and session names are relative to the profile, so it goes in the
+    same place relative to the code as it has in the source tree.
+    """
+    if code_dir is None or not origin:
+        return None
+    try:
+        up = os.path.relpath(profile_dir, origin)
+    except ValueError:
+        return None
+    if up not in (os.curdir, os.pardir):
+        return None   # not where importbar looks; IMPORTBAR_PROFILE or profile= needed
+    dest = code_dir if up == os.curdir else code_dir.rpartition("/")[0]
+    if up == os.pardir and not code_dir:
+        return None   # would be above the bundle root
+    return dest or "."
 
 
 def _rel(p):
@@ -211,8 +260,36 @@ def _labels_for(store, directory, existing):
     return out
 
 
-def write_profile(where, labels=(), store=None):
-    """Write (or refresh) the profile for code in ``where`` from local history."""
+def _frozen_labels(store, directory, existing):
+    """Sessions in a frozen app's history that belong to code in ``directory``.
+
+    A frozen app labels sessions by the calling file's path inside the bundle
+    (``myapp/cli.py::main``). Returns {label: name in the profile}: that path
+    made relative to ``directory``, found by matching it against the source
+    files there (or against the sessions the profile already has).
+    """
+    out = {}
+    for label in store.sessions:
+        path, sep, func = label.rpartition("::")
+        if not sep or os.path.isabs(path):
+            if existing is not None and label in existing.sessions:
+                out[label] = label   # custom labels already in the profile
+            continue
+        parts = path.split("/")
+        for k in range(len(parts)):   # longest match first
+            name = "/".join(parts[k:]) + "::" + func
+            if ((existing is not None and name in existing.sessions)
+                    or os.path.isfile(os.path.join(directory, *parts[k:]))):
+                out[label] = name
+                break
+    return out
+
+
+def write_profile(where, labels=(), store=None, frozen=False):
+    """Write (or refresh) the profile for code in ``where`` from local history.
+
+    ``frozen``: ``store`` is a frozen app's history (see ``_frozen_labels``).
+    """
     store = store or Store.load()
     where = os.path.abspath(where)
     if where.endswith(".txt") or (os.path.exists(where) and not os.path.isdir(where)):
@@ -221,8 +298,15 @@ def write_profile(where, labels=(), store=None):
         path = os.path.join(where, _profile.FILENAME)
     base = os.path.dirname(path)
     existing = _profile.Profile.load(path) if os.path.exists(path) else None
-    wanted = list(labels) + [l for l in _labels_for(store, base, existing) if l not in labels]
-    prof = _profile.build(store, wanted, base)
+    names = None
+    if frozen:
+        names = _frozen_labels(store, base, existing)
+        wanted = list(names)
+    else:
+        wanted = list(labels) + [l for l in _labels_for(store, base, existing) if l not in labels]
+    prof = _profile.build(store, wanted, base, names)
+    if frozen:
+        prof.info += " source=frozen-app"
     if existing is not None:
         # Keep sessions this machine hasn't run, rather than silently dropping them.
         for label, s in existing.sessions.items():
@@ -249,11 +333,29 @@ def _closure(prof, roots):
 
 
 def export(argv):
-    where = argv[0] if argv else os.getcwd()
+    import argparse
+    ap = argparse.ArgumentParser(
+        prog="python -m importbar export",
+        description="Refresh %s from the timings this machine has learned." % _profile.FILENAME)
+    ap.add_argument("where", nargs="?", default=os.getcwd(),
+                    help="the code's folder, a script in it, or the profile (default: .)")
+    ap.add_argument("--from", dest="app", metavar="APP",
+                    help="use what a frozen (PyInstaller) build learned instead of this "
+                         "Python environment: its executable, its folder, or a .app")
+    args = ap.parse_args(argv)
+    where = args.where
     if os.path.isfile(where) and where.endswith(".py"):
         where = os.path.dirname(os.path.abspath(where))
-    store = Store.load()
-    path = write_profile(where, store=store)
+    if args.app:
+        hist = frozen_history(args.app)
+        if hist is None:
+            print("No history found for %s in %s." % (args.app, cache_dir()))
+            print("Run the built app at least once on this machine, as this user, first.")
+            return 1
+        store = Store.load(hist)
+    else:
+        store = Store.load()
+    path = write_profile(where, store=store, frozen=bool(args.app))
     prof = _profile.Profile.load(path)
     n = len(prof.sessions) if prof else 0
     print("wrote %s (%d session%s)" % (_rel(path), n, "" if n == 1 else "s"))
@@ -263,5 +365,9 @@ def export(argv):
             print("  %-40s warm %s  cold %s" % (
                 label[-40:], *("%.2fs" % tot[m] if m in tot else "-" for m in MODES)))
     if not n:
-        print("No sessions from code in that directory are in this machine's history yet.")
+        if args.app:
+            print("None of the app's sessions match code in that directory. Give the folder")
+            print("of the source file that calls importbar (or the one above it).")
+        else:
+            print("No sessions from code in that directory are in this machine's history yet.")
     return 0

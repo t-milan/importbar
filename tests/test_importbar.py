@@ -2,6 +2,7 @@ import io
 import json
 import marshal
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -362,6 +363,7 @@ def test_measure_writes_profile(env):
     env(None, args=["-m", "importbar", "measure", "--runs", "2", "--cold", "1", "app.py"], cwd=d)
     out = env.last_stdout
     assert "wrote importbar-profile.txt" in out and "cold start" in out
+    assert '--add-data "importbar-profile.txt:."' in out
     text = (d / "importbar-profile.txt").read_text()
     assert "session  app.py::<module>" in text
     from importbar._profile import Profile
@@ -470,16 +472,79 @@ def test_frozen_app_labels_cache_key_and_profile_lookup(tmp_path, monkeypatch):
     assert _profile.find(str(bundle / "myapp")) == str(bundle / _profile.FILENAME)
 
 
+def test_measure_tells_where_the_profile_goes_in_a_bundle(env):
+    d = env.tmp / "proj"
+    (d / "myapp").mkdir(parents=True)
+    (d / "myapp" / "__init__.py").write_text("")
+    (d / "myapp" / "__main__.py").write_text("import myapp.cli\n")
+    (d / "myapp" / "cli.py").write_text(APP)
+    env(None, args=["-m", "importbar", "measure", "--runs", "1", "--cold", "0", "-m", "myapp"],
+        cwd=d)
+    src = os.path.join("myapp", "importbar-profile.txt")
+    assert '--add-data "%s:myapp"' % src in env.last_stdout
+    assert (d / src).is_file()
+
+
+FAKE_FROZEN = """
+import sys
+sys.frozen = True
+sys._MEIPASS, sys.executable = sys.argv[1], sys.argv[2]
+code = "import importbar\\nwith importbar.progress(display=False):\\n    import fb\\n    import fc\\n"
+exec(compile(code, "myapp/cli.py", "exec"), {"__name__": "myapp.cli"})
+"""
+
+
+def test_export_from_a_frozen_apps_history(env):
+    # A pretend one-folder build, run twice warm and once cold.
+    app = env.tmp / "dist" / "app"
+    (app / "_internal" / "myapp").mkdir(parents=True)
+    exe = app / "app"
+    (env.tmp / "fake_frozen.py").write_text(FAKE_FROZEN)
+    run = [str(env.tmp / "fake_frozen.py"), str(app / "_internal"), str(exe)]
+    for extra in ({}, {}, {"FAKE_COLD": "2", "IMPORTBAR_ASSUME": "cold"}):
+        env(None, extra, args=run)
+    # The app's source tree.
+    src = env.tmp / "src"
+    (src / "myapp").mkdir(parents=True)
+    (src / "myapp" / "cli.py").write_text("")
+
+    from importbar._profile import Profile
+    env(None, args=["-m", "importbar", "export", str(src / "myapp"), "--from", str(exe)])
+    assert "(1 session)" in env.last_stdout
+    prof = Profile.load(str(src / "myapp" / "importbar-profile.txt"))
+    s = prof.sessions["cli.py::<module>"]            # named as `measure` would name it
+    assert s["roots"] == ["fb", "fc"] and {"warm", "cold"} <= set(s["total"])
+    assert "fc" in prof.times["cold"] and prof.edges["fb"] == ["fa"]
+    assert "source=frozen-app" in prof.info
+
+    # One folder up, the name includes the package; the app's folder works too.
+    env(None, args=["-m", "importbar", "export", str(src), "--from", str(app)])
+    assert "myapp/cli.py::<module>" in Profile.load(str(src / "importbar-profile.txt")).sessions
+    env(None, args=["-m", "importbar", "report", "--from", str(exe)])
+    assert "fc" in env.last_stdout and "myapp/cli.py::<module>" in env.last_stdout
+
+    # Code that isn't there, or an app that never ran: say so.
+    (env.tmp / "other").mkdir()
+    env(None, args=["-m", "importbar", "export", str(env.tmp / "other"), "--from", str(exe)])
+    assert "None of the app's sessions match" in env.last_stdout
+    with pytest.raises(AssertionError) as e:
+        env(None, args=["-m", "importbar", "export", str(src), "--from", str(env.tmp / "nope")])
+    assert "No history found" in str(e.value)
+
+
 def test_pyinstaller_onefile_build_uses_profile_and_learns(env):
     pytest.importorskip("PyInstaller")
     d = _app(env)
     env(None, args=["-m", "importbar", "measure", "--runs", "2", "--cold", "0", "app.py"], cwd=d)
+    # Build with exactly the line `measure` suggests.
+    add_data = re.search(r'--add-data "([^"]+)"', env.last_stdout).group(1)
+    src, _, dest = add_data.rpartition(":")
     build = env.tmp / "build"
     out = subprocess.run(
         [sys.executable, "-m", "PyInstaller", "--onefile", "--noconfirm", "--log-level", "WARN",
          "--name", "app", "--distpath", str(build / "dist"), "--workpath", str(build / "work"),
          "--specpath", str(build), "--paths", os.path.abspath(SRC), "--paths", str(env.tmp / "pkgs"),
-         "--add-data", "%s%s." % (d / "importbar-profile.txt", os.pathsep), str(d / "app.py")],
+         "--add-data", "%s:%s" % (d / src, dest), str(d / "app.py")],
         capture_output=True, text=True, timeout=600)
     assert out.returncode == 0, out.stdout + out.stderr
     exe = build / "dist" / ("app.exe" if sys.platform == "win32" else "app")
@@ -488,10 +553,10 @@ def test_pyinstaller_onefile_build_uses_profile_and_learns(env):
     e.pop("IMPORTBAR_DISABLE", None)
     e.pop("IMPORTBAR_PROFILE", None)
 
-    def run():
+    def run(extra=None):
         # Launched from an unrelated folder, as users do.
-        p = subprocess.run([str(exe)], env=e, cwd=str(env.tmp), capture_output=True,
-                           text=True, timeout=120)
+        p = subprocess.run([str(exe)], env=dict(e, **(extra or {})), cwd=str(env.tmp),
+                           capture_output=True, text=True, timeout=120)
         assert p.returncode == 0, p.stdout + p.stderr
         return json.loads([l for l in p.stdout.splitlines() if l.startswith("{")][-1])
 
@@ -504,3 +569,12 @@ def test_pyinstaller_onefile_build_uses_profile_and_learns(env):
     st = marshal.loads(files[0].read_bytes())
     assert st["sessions"]["app.py::<module>"]["total"]["warm"][2] == 2
     assert {"fa", "fb", "fc"} <= set(st["times"]["warm"])
+
+    # A cold start of the built app makes it into the source's profile.
+    assert run({"FAKE_COLD": "2", "IMPORTBAR_ASSUME": "cold"})["mode"] == "cold"
+    env(None, {"IMPORTBAR_CACHE_DIR": str(cache)},
+        args=["-m", "importbar", "export", str(d), "--from", str(exe)])
+    from importbar._profile import Profile
+    prof = Profile.load(str(d / "importbar-profile.txt"))
+    assert "cold" in prof.sessions["app.py::<module>"]["total"]
+    assert "fc" in prof.times["cold"] and "source=frozen-app" in prof.info

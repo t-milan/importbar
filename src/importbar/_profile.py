@@ -218,8 +218,12 @@ def portable_label(label, base_dir):
 
 # ---------------------------------------------------------------------- building
 
-def build(store, labels, base_dir):
-    """A profile with the given sessions from a local store, and everything they import."""
+def build(store, labels, base_dir, names=None):
+    """A profile with the given sessions from a local store, and everything they import.
+
+    ``names`` optionally maps a label to the name it gets in the profile;
+    otherwise the name is the label made relative to ``base_dir``.
+    """
     prof = Profile()
     prof.info = "python=%s platform=%s" % (sys.version.split()[0], sys.platform)
     for m in MODES:
@@ -230,7 +234,8 @@ def build(store, labels, base_dir):
         s = store.sessions.get(label)
         if not s:
             continue
-        prof.sessions[portable_label(label, base_dir)] = {
+        name = (names or {}).get(label) or portable_label(label, base_dir)
+        prof.sessions[name] = {
             "roots": list(s.get("roots", [])),
             "other": {m: stat_mean(st) for m, st in s.get("other", {}).items()},
             "total": {m: stat_mean(st) for m, st in s.get("total", {}).items()},
