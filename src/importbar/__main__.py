@@ -1,6 +1,9 @@
-"""Command line: inspect or reset learned timings, or try the bar.
+"""Command line: measure startups, share them, inspect or reset learned timings.
 
-    python -m importbar report          # slowest packages in this environment
+    python -m importbar measure app.py [args]   # time warm + cold starts, write importbar-profile.txt
+    python -m importbar measure -m mypkg        # same, for python -m mypkg
+    python -m importbar export [DIR]            # refresh DIR's profile from what this machine learned
+    python -m importbar report                  # slowest packages in this environment
     python -m importbar try numpy pandas
     python -m importbar clear
     python -m importbar path
@@ -9,26 +12,38 @@
 import os
 import sys
 
-from ._store import Store, stat_mean
+from ._store import MODES, Store, stat_mean
 
 
 def _report(store, top):
-    if not store.packages:
+    names = set(store.times["warm"]) | set(store.times["cold"])
+    if not names:
         print("No timings learned yet for this environment (%s)." % store.path)
         return
-    rows = sorted(((stat_mean(st), name, st[2]) for name, st in store.packages.items()),
-                  reverse=True)
-    print("%-28s %10s %6s" % ("package (self time)", "expected", "runs"))
-    for exp, name, n in rows[:top]:
-        print("%-28s %9.3fs %6d" % (name, exp, n))
+
+    def exp(p, m):
+        e = store.times[m].get(p)
+        return (stat_mean(e[0]), e[0][2]) if e else (None, 0)
+
+    rows = sorted(names, key=lambda p: -max(exp(p, m)[0] or 0.0 for m in MODES))
+    print("%-28s %10s %10s %6s" % ("package (self time)", "warm", "cold", "runs"))
+    for name in rows[:top]:
+        (w, nw), (c, nc) = exp(name, "warm"), exp(name, "cold")
+        print("%-28s %10s %10s %6s" % (name, "%.3fs" % w if w is not None else "-",
+                                       "%.3fs" % c if c is not None else "-",
+                                       "%d/%d" % (nw, nc)))
     if len(rows) > top:
         print("... %d more" % (len(rows) - top))
     if store.sessions:
-        print("\n%-50s %10s  roots" % ("session", "total"))
+        print("\n%-44s %8s %8s  roots" % ("session", "warm", "cold"))
         for label, s in store.sessions.items():
-            tot = stat_mean(s["total"]) if s.get("total") else float("nan")
-            short = label if len(label) <= 50 else "…" + label[-49:]
-            print("%-50s %9.3fs  %s" % (short, tot, ", ".join(s.get("roots", []))))
+            tot = s.get("total", {})
+            cols = ["%.2fs" % stat_mean(tot[m]) if tot.get(m) else "-" for m in MODES]
+            short = label if len(label) <= 44 else "…" + label[-43:]
+            print("%-44s %8s %8s  %s" % (short, cols[0], cols[1], ", ".join(s.get("roots", []))))
+    if store.priors:
+        print("\ncold starts so far, by context: " + "  ".join(
+            "%s %d/%d" % (ctx, cold, n) for ctx, (cold, n) in sorted(store.priors.items())))
 
 
 def main(argv=None):
@@ -37,6 +52,12 @@ def main(argv=None):
     if cmd == "report":
         top = int(argv[0]) if argv else 25
         _report(Store.load(), top)
+    elif cmd == "measure":
+        from ._measure import measure
+        return measure(argv)
+    elif cmd == "export":
+        from ._measure import export
+        return export(argv)
     elif cmd == "path":
         print(Store().path)
     elif cmd == "clear":
